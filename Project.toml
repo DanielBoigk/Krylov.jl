@@ -7,14 +7,7 @@ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
-[weakdeps]
-CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-
-[extensions]
-KrylovCUDAExt = "CUDA"
-
 [compat]
-CUDA = "5, 6"
 LinearAlgebra = "1.10"
 Printf = "1.10"
 Random = "1.10"

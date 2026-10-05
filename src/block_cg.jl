@@ -103,10 +103,22 @@ function block_cg! end
     kgram!(G, X, Y)
 
 `G ← Xᴴ Y` for tall and skinny blocks `X` and `Y` (`n × r` and `n × s` with `n ≫ r, s`), the
-Gram products of [`block_cg`](@ref). The generic method calls `mul!`; array backends can
-specialise it where the default kernel is slow for such shapes.
+Gram products of [`block_cg`](@ref). In double precision with 2 to 8 columns it computes one
+matrix-vector product per column, otherwise it calls `mul!`. Array backends can specialise it
+where another kernel is faster for such shapes.
 """
-kgram!(G, X, Y) = mul!(G, X', Y)
+function kgram!(G, X, Y)
+  # GEMM kernels for such shapes often do not split the long reduction dimension: in double
+  # precision one GEMV per column was 2–30× faster with cuBLAS and up to 2× with OpenBLAS.
+  # Single precision GEMM is fast already.
+  if eltype(G) <: Union{Float64, ComplexF64} && 1 < size(Y, 2) ≤ 8
+    for j in axes(Y, 2)
+      mul!(view(G, :, j), X', view(Y, :, j))
+    end
+    return G
+  end
+  return mul!(G, X', Y)
+end
 
 # All small dense work (Gram matrices of the search block, its orthonormalization, the r × r
 # solves) happens on the host in buffers of the workspace, with the plain-Julia kernels below:
