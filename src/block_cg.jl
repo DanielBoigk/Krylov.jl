@@ -108,27 +108,27 @@ specialise it where the default kernel is slow for such shapes.
 """
 kgram!(G, X, Y) = mul!(G, X', Y)
 
-# The first `r * c` entries of a column-major buffer, as an `r × c` matrix (no copy).
-_bcg_block(X::AbstractMatrix, r::Integer, c::Integer) = size(X) == (r, c) ? X : reshape(view(vec(X), 1:(r * c)), r, c)
-
-# a small block → a freshly allocated host matrix
-_bcg_host(X::AbstractMatrix{FC}) where FC = copyto!(Matrix{FC}(undef, size(X)), X)
+# All small dense work (Gram matrices of the search block, its orthonormalization, the r × r
+# solves) happens on the host in buffers of the workspace, with the plain-Julia kernels below:
+# no allocation after the workspace is built, and any floating-point type (BigFloat, Float16)
+# works. All device operations act on whole n × p and p × p arrays (no views, which GPU array
+# packages may hand to slow generic kernels): after an orthonormalization with rank r < p the
+# trailing columns of P are zero, and the coefficient matrices copied back to the device have
+# zero rows r+1:p, so the full products equal the products with the leading r columns.
 
 # X ← (I - V Vᴴ) X: orthogonal projection onto the range of A (V orthonormal)
 function _bcg_project!(X, workspace)
   size(workspace.V, 2) == 0 && return X
-  K = _bcg_block(workspace.K, size(workspace.K, 1), size(X, 2))
-  kgram!(K, workspace.V, X)
-  mul!(X, workspace.V, K, -one(eltype(X)), one(eltype(X)))
+  kgram!(workspace.K, workspace.V, X)
+  mul!(X, workspace.V, workspace.K, -one(eltype(X)), one(eltype(X)))
   return X
 end
 
 # X ← X - V (WᴴV)⁻¹ Wᴴ X: oblique projection onto {Wᴴx = 0} along the null space
 function _bcg_ground!(X, workspace)
   size(workspace.V, 2) == 0 && return X
-  K = _bcg_block(workspace.K, size(workspace.K, 1), size(X, 2))
-  kgram!(K, workspace.W, X)
-  mul!(X, workspace.F, K, -one(eltype(X)), one(eltype(X)))
+  kgram!(workspace.K, workspace.W, X)
+  mul!(X, workspace.F, workspace.K, -one(eltype(X)), one(eltype(X)))
   return X
 end
 
@@ -142,15 +142,83 @@ function _bcg_colnorms!(out::Vector{T}, X, workspace) where T
   return out
 end
 
+# Cyclic Jacobi method for the Hermitian matrix in the leading n × n block of A: eigenvalues in
+# λ[1:n], eigenvectors in the columns of the leading n × n block of E. A is overwritten. Each
+# rotation is a unitary G = diag(1, conj(φ)) R, where φ = a_pq/|a_pq| makes the 2 × 2 block real
+# and R is the real Jacobi rotation that annihilates it.
+function _bcg_jacobi!(A::Matrix{FC}, E::Matrix{FC}, λ::Vector{T}, n::Int) where {T, FC}
+  for j = 1:n, i = 1:n
+    E[i,j] = i == j ? one(FC) : zero(FC)
+  end
+  for sweep = 1:60
+    off = zero(T)
+    nrm = zero(T)
+    for j = 1:n, i = 1:n
+      a = abs2(A[i,j])
+      nrm += a
+      i == j || (off += a)
+    end
+    off ≤ eps(T)^2 * nrm && break
+    for p = 1:n-1, q = p+1:n
+      apq = A[p,q]
+      aa = abs(apq)
+      aa == 0 && continue
+      φ = apq / aa
+      θ = (real(A[q,q]) - real(A[p,p])) / (2 * aa)
+      t = θ == 0 ? one(T) : sign(θ) / (abs(θ) + sqrt(θ^2 + one(T)))
+      c = inv(sqrt(t^2 + one(T)))
+      s = t * c
+      g11, g12, g21, g22 = FC(c), FC(s), -s * conj(φ), c * conj(φ)
+      for k = 1:n  # columns: A ← A G, E ← E G
+        akp, akq = A[k,p], A[k,q]
+        A[k,p] = akp * g11 + akq * g21
+        A[k,q] = akp * g12 + akq * g22
+        ekp, ekq = E[k,p], E[k,q]
+        E[k,p] = ekp * g11 + ekq * g21
+        E[k,q] = ekp * g12 + ekq * g22
+      end
+      for k = 1:n  # rows: A ← Gᴴ A
+        apk, aqk = A[p,k], A[q,k]
+        A[p,k] = conj(g11) * apk + conj(g21) * aqk
+        A[q,k] = conj(g12) * apk + conj(g22) * aqk
+      end
+      A[p,q] = A[q,p] = zero(FC)
+      A[p,p] = real(A[p,p])
+      A[q,q] = real(A[q,q])
+    end
+  end
+  for i = 1:n
+    λ[i] = real(A[i,i])
+  end
+  return λ
+end
+
+# perm[1:n] ← indices of λ[1:n] in decreasing order (insertion sort, n is the block size)
+function _bcg_sortperm!(perm::Vector{Int}, λ::Vector, n::Int)
+  for i = 1:n
+    perm[i] = i
+  end
+  for i = 2:n
+    k = perm[i]
+    j = i - 1
+    while j ≥ 1 && λ[perm[j]] < λ[k]
+      perm[j+1] = perm[j]
+      j -= 1
+    end
+    perm[j+1] = k
+  end
+  return perm
+end
+
 # Replace the leading columns of P by an orthonormal basis of span(P) and return its dimension
 # r (SVQB). The columns are scaled to unit norm first, so that only (near) linear dependence,
 # not scale, decides which directions are dropped. Q is used as scratch.
 function _bcg_orthonormalize!(workspace, rank_tol::T) where T
   P, Q, d = workspace.P, workspace.Q, workspace.d
-  FC = eltype(P)
+  Gh, Eh, Th, λ, perm = workspace.Gh, workspace.Eh, workspace.Th, workspace.λh, workspace.perm
   p = size(P, 2)
   kgram!(workspace.G, P, P)
-  Gh = _bcg_host(workspace.G)
+  copyto!(Gh, workspace.G)
   tiny = floatmin(T) / eps(T)
   for j = 1:p
     d[j] = real(Gh[j,j]) > tiny ? inv(sqrt(real(Gh[j,j]))) : zero(T)
@@ -158,38 +226,120 @@ function _bcg_orthonormalize!(workspace, rank_tol::T) where T
   for j = 1:p, i = 1:p
     Gh[i,j] *= d[i] * d[j]
   end
-  E = eigen!(Hermitian(Gh))
-  λmax = maximum(E.values; init = zero(T))
+  _bcg_jacobi!(Gh, Eh, λ, p)
+  _bcg_sortperm!(perm, λ, p)
+  λmax = max(λ[perm[1]], zero(T))
   λmax > 0 || return 0
-  r = count(λ -> λ > rank_tol * λmax, E.values)
+  r = 0
+  while r < p && λ[perm[r+1]] > rank_tol * λmax
+    r += 1
+  end
   r == 0 && return 0
-  Th = zeros(FC, p, r)
-  for (c, j) in enumerate(p:-1:p-r+1)  # the r largest eigenvalues
-    s = inv(sqrt(E.values[j]))
+  FC = eltype(Th)
+  for c = 1:p  # the r largest eigenvalues; columns r+1:p zero
+    j = perm[c]
+    s = c ≤ r ? inv(sqrt(λ[j])) : zero(T)
     for i = 1:p
-      Th[i,c] = d[i] * E.vectors[i,j] * s
+      Th[i,c] = c ≤ r ? d[i] * Eh[i,j] * s : zero(FC)
     end
   end
-  Tr = _bcg_block(workspace.C, p, r)
-  copyto!(Tr, Th)
-  Qr = _bcg_block(Q, size(Q, 1), r)
-  mul!(Qr, P, Tr)
-  copyto!(_bcg_block(P, size(P, 1), r), Qr)
+  copyto!(workspace.C, Th)
+  mul!(Q, P, workspace.C)
+  P .= Q
   return r
 end
 
-# Solve the small Hermitian positive definite system G Y = C on the host (Cholesky, with an
-# eigenvalue-based pseudo-inverse as fallback). The result overwrites C.
-function _bcg_spd_solve!(G::Matrix{FC}, C::Matrix{FC}) where FC
+# Factorize the Hermitian positive (semi)definite matrix in the leading r × r block of Gh for
+# _bcg_spd_solve!: Cholesky L Lᴴ in Lh, or, if that fails, its eigendecomposition in Eh, λh (for
+# a pseudo-inverse). Gh is kept.
+function _bcg_spd_factor!(workspace, r::Int)
+  Gh, L = workspace.Gh, workspace.Lh
+  FC = eltype(Gh)
   T = real(FC)
-  F = cholesky!(Hermitian(copy(G)); check = false)
-  if issuccess(F)
-    ldiv!(F, C)
+  ok = true
+  for j = 1:r
+    s = real(Gh[j,j])
+    for k = 1:j-1
+      s -= abs2(L[j,k])
+    end
+    if !(s > 0)
+      ok = false
+      break
+    end
+    L[j,j] = sqrt(s)
+    for i = j+1:r
+      v = Gh[i,j]
+      for k = 1:j-1
+        v -= L[i,k] * conj(L[j,k])
+      end
+      L[i,j] = v / L[j,j]
+    end
+  end
+  if !ok
+    W = workspace.Wh
+    for j = 1:r, i = 1:r
+      W[i,j] = Gh[i,j]
+    end
+    _bcg_jacobi!(W, workspace.Eh, workspace.λh, r)
+  end
+  workspace.chol_ok = ok
+  return workspace
+end
+
+# Ch[1:r, 1:ncols] ← G⁻¹ Ch[1:r, 1:ncols] with the factorization of _bcg_spd_factor!, times
+# `scale`; the rows r+1:p of Ch are set to zero.
+function _bcg_spd_solve!(workspace, r::Int, ncols::Int, scale = true)
+  C = workspace.Ch
+  FC = eltype(C)
+  T = real(FC)
+  if workspace.chol_ok
+    L = workspace.Lh
+    for c = 1:ncols
+      for i = 1:r  # L z = c
+        v = C[i,c]
+        for k = 1:i-1
+          v -= L[i,k] * C[k,c]
+        end
+        C[i,c] = v / L[i,i]
+      end
+      for i = r:-1:1  # Lᴴ y = z
+        v = C[i,c]
+        for k = i+1:r
+          v -= conj(L[k,i]) * C[k,c]
+        end
+        C[i,c] = v / conj(L[i,i])
+      end
+    end
   else
-    E = eigen(Hermitian(G))
-    λmax = maximum(abs, E.values)
-    λinv = [λ > sqrt(eps(T)) * λmax ? inv(λ) : zero(T) for λ in E.values]
-    C .= E.vectors * (Diagonal(λinv) * (E.vectors' * C))
+    E, λ, w = workspace.Eh, workspace.λh, view(workspace.Wh, :, 1)
+    λmax = zero(T)
+    for i = 1:r
+      λmax = max(λmax, abs(λ[i]))
+    end
+    for c = 1:ncols
+      for j = 1:r  # w = diag(λ⁺) Eᴴ c
+        v = zero(FC)
+        for i = 1:r
+          v += conj(E[i,j]) * C[i,c]
+        end
+        w[j] = λ[j] > sqrt(eps(T)) * λmax ? v / λ[j] : zero(FC)
+      end
+      for i = 1:r  # c = E w
+        v = zero(FC)
+        for j = 1:r
+          v += E[i,j] * w[j]
+        end
+        C[i,c] = v
+      end
+    end
+  end
+  for c = 1:ncols
+    for i = 1:r
+      C[i,c] *= scale
+    end
+    for i = r+1:size(C, 1)
+      C[i,c] = zero(FC)
+    end
   end
   return C
 end
@@ -330,32 +480,32 @@ kwargs_workspace_block_cg = (:nullspace, :grounding)
         exhausted = true
         break
       end
-      Pr = _bcg_block(workspace.P, n, r)
-      Qr = _bcg_block(Q, n, r)
-      mul!(Qr, A, Pr)  # Q ← AP
+      P = workspace.P
+      mul!(Q, A, P)  # Q ← AP
 
-      # Gₖ = PᴴAP (r × r) and αₖ = Gₖ⁻¹ PᴴR (r × p), both solved on the host.
-      Gd = _bcg_block(workspace.G, r, r)
-      kgram!(Gd, Pr, Qr)
-      Gh = _bcg_host(Gd)
+      # Gₖ = PᴴAP (leading r × r block) and αₖ = Gₖ⁻¹ PᴴR (r × p), both solved on the host.
+      kgram!(workspace.G, P, Q)
+      Gh = workspace.Gh
+      copyto!(Gh, workspace.G)
       for j = 1:r, i = 1:j
         Gh[i,j] = (Gh[i,j] + conj(Gh[j,i])) / 2
         Gh[j,i] = conj(Gh[i,j])
       end
-      Cd = _bcg_block(workspace.C, r, p)
-      kgram!(Cd, Pr, R)
-      Ch = _bcg_host(Cd)
-      _bcg_spd_solve!(Gh, Ch)
-      copyto!(Cd, Ch)
+      _bcg_spd_factor!(workspace, r)
+      Cd = workspace.C
+      kgram!(Cd, P, R)
+      copyto!(workspace.Ch, Cd)
+      _bcg_spd_solve!(workspace, r, p)
+      copyto!(Cd, workspace.Ch)
 
       # Xₖ = Xₖ₋₁ + Pαₖ and Rₖ = Rₖ₋₁ - APαₖ (or the true residual every `recompute_every` iterations).
-      mul!(X, Pr, Cd, one(FC), one(FC))
+      mul!(X, P, Cd, one(FC), one(FC))
       if iter % recompute_every == 0
         mul!(R, A, X)
         R .= B .- R
         _bcg_project!(R, workspace)
       else
-        mul!(R, Qr, Cd, -one(FC), one(FC))
+        mul!(R, Q, Cd, -one(FC), one(FC))
       end
 
       _bcg_colnorms!(rnorm, R, workspace)
@@ -376,12 +526,11 @@ kwargs_workspace_block_cg = (:nullspace, :grounding)
       # Next search block: P ← Z + Pβₖ with βₖ = -Gₖ⁻¹ (AP)ᴴZ, A-conjugate to the current P.
       if !(solved || tired || user_requested_exit || overtimed)
         Z = _bcg_precondition!(workspace, M, MisI, ldiv)
-        kgram!(Cd, Qr, Z)
-        copyto!(Ch, Cd)
-        _bcg_spd_solve!(Gh, Ch)
-        Ch .*= -one(FC)
-        copyto!(Cd, Ch)
-        mul!(Z, Pr, Cd, one(FC), one(FC))
+        kgram!(Cd, Q, Z)
+        copyto!(workspace.Ch, Cd)
+        _bcg_spd_solve!(workspace, r, p, -one(FC))
+        copyto!(Cd, workspace.Ch)
+        mul!(Z, P, Cd, one(FC), one(FC))
         @kswap!(workspace.P, workspace.Z)
       end
     end

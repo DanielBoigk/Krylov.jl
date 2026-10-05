@@ -214,6 +214,15 @@ mutable struct BlockCgWorkspace{T,FC,SV,SM} <: BlockKrylovWorkspace{T,FC,SV,SM}
   colsums    :: SM
   maskh      :: Matrix{FC}
   colsumsh   :: Vector{FC}
+  Gh         :: Matrix{FC}
+  Ch         :: Matrix{FC}
+  Th         :: Matrix{FC}
+  Eh         :: Matrix{FC}
+  Lh         :: Matrix{FC}
+  Wh         :: Matrix{FC}
+  λh         :: Vector{T}
+  perm       :: Vector{Int}
+  chol_ok    :: Bool
   d          :: Vector{T}
   bnorm      :: Vector{T}
   rnorm      :: Vector{T}
@@ -260,8 +269,10 @@ function BlockCgWorkspace(m::Integer, n::Integer, p::Integer, SV::Type, SM::Type
   SV = isconcretetype(SV) ? SV : matrix_to_vector(typeof(X))
   SM = isconcretetype(SM) ? SM : typeof(X)
   stats = SimpleStats(0, false, false, false, 0, T[], T[], T[], T[], 0.0, 0.0, "unknown")
+  host() = zeros(FC, p, p)
   workspace = BlockCgWorkspace{T,FC,SV,SM}(m, n, p, ΔX, X, R, Z, P, Q, V, W, F, K, G, C, mask, colsums,
-                                           ones(FC, 1, p), zeros(FC, p), zeros(T, p), zeros(T, p), zeros(T, p),
+                                           ones(FC, 1, p), zeros(FC, p), host(), host(), host(), host(), host(), host(),
+                                           zeros(T, p), collect(1:p), true, zeros(T, p), zeros(T, p), zeros(T, p),
                                            zeros(T, p), fill(true, p), zero(T), false, stats)
   workspace.stats.allocation_timer = start_allocation_time |> ktimer
   return workspace

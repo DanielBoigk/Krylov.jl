@@ -9,7 +9,7 @@ using LinearAlgebra
 # (measured on an RTX 3080 with cuBLAS 13). For wider blocks GEMM is faster again.
 const GEMV_MAX_COLS = 8
 
-function Krylov.kgram!(G::DenseCuMatrix{Float64}, X::DenseCuMatrix{Float64}, Y::DenseCuMatrix{Float64})
+function Krylov.kgram!(G::StridedCuMatrix{Float64}, X::StridedCuMatrix{Float64}, Y::StridedCuMatrix{Float64})
   if 1 < size(Y, 2) ≤ GEMV_MAX_COLS
     for j in axes(Y, 2)
       mul!(view(G, :, j), X', view(Y, :, j))

@@ -43,7 +43,9 @@ orthogonal to the null space).
 The search blocks are orthonormalized with a rank-revealing eigendecomposition of their Gram
 matrix, so linearly dependent right-hand sides do not cause a breakdown, and converged columns
 are removed from the block. Each column has its own stopping tolerance
-`atol + rtol * ‖Π bⱼ‖`.
+`atol + rtol * ‖Π bⱼ‖`. The small dense computations (Gram matrices of the search block, their
+eigendecomposition and the block solves) use preallocated buffers and generic Julia code, so
+`block_cg!` allocates nothing and works with any floating-point type, e.g. `BigFloat`.
 
 ```@docs
 block_cg

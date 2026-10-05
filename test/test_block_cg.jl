@@ -171,6 +171,20 @@ end
     @test norm(A * X - B) ≤ 1f-4 * norm(B)
   end
 
+  @testset "precision: $FC" for FC in (BigFloat, Float16, ComplexF32)
+    T = real(FC)
+    A = neumann_laplacian(6; FC)                # assembled in FC (exact null space)
+    B = FC.(neumann_rhs(6, 3)[1])
+    B .-= sum(B; dims=1) ./ 36                  # compatible in the precision FC itself
+    X, stats = block_cg(A, B; nullspace=ones(T, 36), atol=zero(T), rtol=T == Float16 ? T(0.05) : √eps(T))   # Float16: about 3 digits
+    @test eltype(X) == FC
+    @test stats.solved
+    @test norm(A * X - B) ≤ (T == Float16 ? T(0.1) : 10 * √eps(T)) * norm(B)
+    A2, b2 = symmetric_definite(FC=FC)
+    X2, stats2 = block_cg(A2, hcat(b2, 2b2 .+ one(FC)))
+    @test stats2.solved
+  end
+
   @testset "allocations independent of n" begin
     function block_cg_bytes(m)
       A = neumann_laplacian(m)
